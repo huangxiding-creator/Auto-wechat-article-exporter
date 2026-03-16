@@ -1,0 +1,20 @@
+# These owners will be the default owners for everything in the repo.
+* @huangxiding-creator
+
+# Order is important; the last matching pattern takes the most precedence.
+# So someone listed as the owner of /src/api.ts will be the owner of that file,
+# even if they're not listed as the owner of /src.
+
+# Source code
+/src/ @huangxiding-creator
+
+# Documentation
+/docs/ @huangxiding-creator
+/README.md @huangxiding-creator
+
+# GitHub configuration
+/.github/ @huangxiding-creator
+
+# Build and config
+/package.json @huangxiding-creator
+/tsconfig.json @huangxiding-creator

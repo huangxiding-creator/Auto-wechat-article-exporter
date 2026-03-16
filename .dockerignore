@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.browser-data/
+Downloads/
+*.log
+.git/
+.github/
+.vscode/
+.idea/
+*.md
+!README.md
+.env*
+.ESLINTRC*
+.prettierrc*
+jest.config.js

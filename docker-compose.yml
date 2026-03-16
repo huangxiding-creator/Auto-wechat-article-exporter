@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  wechat-exporter:
+    build: .
+    container_name: wechat-article-exporter
+    volumes:
+      # Mount accounts file
+      - ./accounts.txt:/app/accounts.txt:ro
+      # Mount output directory
+      - ./Downloads:/app/Downloads
+      # Mount browser data for persistent login
+      - ./.browser-data:/app/.browser-data
+    environment:
+      - NODE_ENV=production
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+    # Use host network for better browser support
+    network_mode: host

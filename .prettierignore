@@ -1,0 +1,7 @@
+dist/
+node_modules/
+coverage/
+Downloads/
+.browser-data/
+*.log
+package-lock.json

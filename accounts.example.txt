@@ -1,0 +1,9 @@
+# WeChat Article Exporter - Account List Example
+# Copy this file to 'accounts.txt' and add your target accounts
+# One account name per line, lines starting with # are ignored
+
+# Example accounts (replace with your own):
+# 工程豹
+# 总包说
+# 人民日报
+# 央视新闻

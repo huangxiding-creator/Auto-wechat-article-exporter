@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WeChat Article Exporter Configuration",
+  "description": "Configuration file for WeChat Article Exporter",
+  "type": "object",
+  "properties": {
+    "output": {
+      "type": "object",
+      "properties": {
+        "directory": {
+          "type": "string",
+          "default": "Downloads",
+          "description": "Output directory for downloaded articles"
+        },
+        "format": {
+          "type": "string",
+          "enum": ["markdown", "html"],
+          "default": "markdown",
+          "description": "Output format for articles"
+        },
+        "mergeSize": {
+          "type": "integer",
+          "default": 500,
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Number of articles per merged file"
+        }
+      }
+    },
+    "download": {
+      "type": "object",
+      "properties": {
+        "concurrency": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Number of concurrent downloads"
+        },
+        "delay": {
+          "type": "integer",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "Delay between requests in milliseconds"
+        },
+        "retryAttempts": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 10,
+          "description": "Number of retry attempts for failed downloads"
+        },
+        "timeout": {
+          "type": "integer",
+          "default": 30000,
+          "minimum": 5000,
+          "maximum": 120000,
+          "description": "Request timeout in milliseconds"
+        }
+      }
+    },
+    "browser": {
+      "type": "object",
+      "properties": {
+        "headless": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run browser in headless mode"
+        },
+        "timeout": {
+          "type": "integer",
+          "default": 90000,
+          "description": "Browser operation timeout in milliseconds"
+        }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["debug", "info", "warn", "error", "silent"],
+          "default": "info",
+          "description": "Logging level"
+        },
+        "file": {
+          "type": "string",
+          "default": "",
+          "description": "Log file path (empty for console only)"
+        }
+      }
+    },
+    "locale": {
+      "type": "string",
+      "enum": ["zh", "en"],
+      "default": "zh",
+      "description": "Language for CLI output"
+    }
+  }
+}
