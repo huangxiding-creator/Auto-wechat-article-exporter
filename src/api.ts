@@ -9,10 +9,8 @@ const BASE_URL = 'https://down.mptext.top'
 
 export class WeChatAPI {
   private client: AxiosInstance
-  private apiKey: string
 
   constructor(apiKey: string) {
-    this.apiKey = apiKey
     this.client = axios.create({
       baseURL: BASE_URL,
       timeout: 30000,

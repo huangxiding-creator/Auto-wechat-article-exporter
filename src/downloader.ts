@@ -6,18 +6,31 @@ import * as fs from 'fs'
 import * as path from 'path'
 import { WeChatAPI } from './api'
 import { AccountInfo, Article } from './types'
+import { NotificationService, DownloadResult } from './notification'
 import chalk from 'chalk'
 import ora from 'ora'
 
 const MERGE_SIZE = 500 // 每500个文件合并为一个
+const DEFAULT_WEBHOOK_URL = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=f543f393-4e15-42f9-90eb-d4b8510e3ba6'
+
+interface DownloadStats {
+  total: number
+  downloaded: number
+  failed: number
+  mergedFiles: number
+  mergedSize: string
+  duration: number
+}
 
 export class ArticleDownloader {
   private api: WeChatAPI
   private downloadDir: string
+  private notification: NotificationService
 
-  constructor(apiKey: string, downloadDir: string) {
+  constructor(apiKey: string, downloadDir: string, webhookUrl?: string) {
     this.api = new WeChatAPI(apiKey)
     this.downloadDir = downloadDir
+    this.notification = new NotificationService(webhookUrl || DEFAULT_WEBHOOK_URL)
 
     // 确保下载目录存在
     if (!fs.existsSync(downloadDir)) {
@@ -61,7 +74,8 @@ export class ArticleDownloader {
   /**
    * 下载单个公众号的所有文章
    */
-  async downloadAllArticles(account: AccountInfo): Promise<number> {
+  async downloadAllArticles(account: AccountInfo): Promise<DownloadStats> {
+    const startTime = Date.now()
     const accountDir = path.join(this.downloadDir, this.sanitizeFilename(account.nickname))
 
     // 创建公众号专属目录
@@ -88,7 +102,7 @@ export class ArticleDownloader {
 
     if (articles.length === 0) {
       console.log(chalk.yellow('  没有找到文章'))
-      return 0
+      return { total: 0, downloaded: 0, failed: 0, mergedFiles: 0, mergedSize: '0 KB', duration: 0 }
     }
 
     // 下载每篇文章
@@ -97,6 +111,8 @@ export class ArticleDownloader {
 
     for (let i = 0; i < articles.length; i++) {
       const article = articles[i]
+      if (!article) continue
+
       const progress = `[${i + 1}/${articles.length}]`
 
       try {
@@ -130,7 +146,19 @@ export class ArticleDownloader {
     }
 
     console.log(chalk.cyan(`\n  完成! 成功: ${downloaded}, 失败: ${failed}`))
-    return downloaded
+
+    // 合并文章
+    const mergeResult = await this.mergeAccountArticles(account.nickname)
+
+    const duration = Math.floor((Date.now() - startTime) / 1000)
+    return {
+      total: articles.length,
+      downloaded,
+      failed,
+      mergedFiles: mergeResult.fileCount,
+      mergedSize: mergeResult.totalSize,
+      duration
+    }
   }
 
   /**
@@ -141,25 +169,45 @@ export class ArticleDownloader {
     console.log(chalk.gray(`目标公众号: ${accountNames.join(', ')}`))
     console.log(chalk.gray(`下载目录: ${this.downloadDir}\n`))
 
+    const batchStartTime = Date.now()
+    const allResults: DownloadResult[] = []
     const results: { name: string; status: string; count: number }[] = []
 
     for (const name of accountNames) {
+      const accountStartTime = Date.now()
       try {
         // 搜索公众号
         const account = await this.findAccountByName(name)
 
         if (!account) {
           results.push({ name, status: '未找到', count: 0 })
+          await this.notification.sendErrorNotification(name, '未找到公众号')
           continue
         }
 
         // 下载文章
-        const count = await this.downloadAllArticles(account)
-        results.push({ name, status: '成功', count })
+        const stats = await this.downloadAllArticles(account)
+        results.push({ name, status: '成功', count: stats.downloaded })
+
+        // 发送单个公众号完成通知
+        const result: DownloadResult = {
+          accountName: name,
+          totalArticles: stats.total,
+          downloadedArticles: stats.downloaded,
+          failedArticles: stats.failed,
+          mergedFiles: stats.mergedFiles,
+          mergedFileSize: stats.mergedSize,
+          duration: Math.floor((Date.now() - accountStartTime) / 1000)
+        }
+        allResults.push(result)
+
+        await this.notification.sendDownloadCompleteNotification(result)
 
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
         console.error(chalk.red(`处理公众号 "${name}" 时出错:`), error)
         results.push({ name, status: '失败', count: 0 })
+        await this.notification.sendErrorNotification(name, errorMessage)
       }
     }
 
@@ -180,6 +228,12 @@ export class ArticleDownloader {
     console.log(chalk.gray('─'.repeat(50)))
     const total = results.reduce((sum, r) => sum + r.count, 0)
     console.log(chalk.bold(`总计: ${total} 篇文章\n`))
+
+    // 发送批量完成通知
+    if (allResults.length > 0) {
+      const totalDuration = Math.floor((Date.now() - batchStartTime) / 1000)
+      await this.notification.sendBatchCompleteNotification(allResults, totalDuration)
+    }
   }
 
   /**
@@ -211,7 +265,7 @@ export class ArticleDownloader {
   /**
    * 合并单个公众号的文章
    */
-  private async mergeAccountArticles(accountName: string): Promise<void> {
+  private async mergeAccountArticles(accountName: string): Promise<{ fileCount: number; totalSize: string }> {
     const accountDir = path.join(this.downloadDir, accountName)
     const mergedDir = path.join(accountDir, 'merged')
 
@@ -219,7 +273,7 @@ export class ArticleDownloader {
 
     // 获取所有 .md 文件（排除已合并的）
     const mdFiles = fs.readdirSync(accountDir)
-      .filter(name => name.endsWith('.md') && !name.startsWith('_merged_'))
+      .filter(name => name.endsWith('.md') && !name.includes('+合并'))
       .map(name => ({
         name,
         path: path.join(accountDir, name),
@@ -229,7 +283,7 @@ export class ArticleDownloader {
 
     if (mdFiles.length === 0) {
       console.log(chalk.gray(`  没有 Markdown 文件需要合并`))
-      return
+      return { fileCount: 0, totalSize: '0 KB' }
     }
 
     console.log(chalk.gray(`  找到 ${mdFiles.length} 个 Markdown 文件`))
@@ -257,6 +311,7 @@ export class ArticleDownloader {
     console.log(chalk.gray(`  将合并为 ${mergeCount} 个文件 (每${MERGE_SIZE}个文件合并)`))
 
     // 分批合并
+    let totalSizeBytes = 0
     for (let i = 0; i < mergeCount; i++) {
       const start = i * MERGE_SIZE
       const end = Math.min(start + MERGE_SIZE, totalFiles)
@@ -283,7 +338,16 @@ export class ArticleDownloader {
 
       // 写入合并文件
       fs.writeFileSync(mergedFilePath, contents.join('\n'), 'utf-8')
-      console.log(chalk.green(`  ✓ 已创建: ${mergedFileName} (${(contents.join('\n').length / 1024).toFixed(1)} KB)`))
+      const fileSize = (contents.join('\n').length / 1024).toFixed(1)
+      console.log(chalk.green(`  ✓ 已创建: ${mergedFileName} (${fileSize} KB)`))
+      totalSizeBytes += contents.join('\n').length
+    }
+
+    return {
+      fileCount: mergeCount,
+      totalSize: totalSizeBytes > 1024 * 1024
+        ? `${(totalSizeBytes / 1024 / 1024).toFixed(2)} MB`
+        : `${(totalSizeBytes / 1024).toFixed(1)} KB`
     }
   }
 

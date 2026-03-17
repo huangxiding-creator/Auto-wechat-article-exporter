@@ -2,7 +2,7 @@
  * 微信公众号文章导出器 - 浏览器自动化模块
  */
 
-import { chromium, Browser, Page, BrowserContext } from 'playwright'
+import { chromium, Page, BrowserContext } from 'playwright'
 import * as fs from 'fs'
 import * as path from 'path'
 
@@ -13,7 +13,6 @@ const API_URL = 'https://down.mptext.top/dashboard/api'
 const USER_DATA_DIR = path.join(process.cwd(), '.browser-data')
 
 export class BrowserAuth {
-  private browser: Browser | null = null
   private context: BrowserContext | null = null
   private page: Page | null = null
 
@@ -41,7 +40,7 @@ export class BrowserAuth {
 
     // 获取或创建页面
     const pages = this.context.pages()
-    this.page = pages.length > 0 ? pages[0] : await this.context.newPage()
+    this.page = pages.length > 0 ? pages[0] ?? null : await this.context.newPage()
   }
 
   /**
@@ -398,7 +397,6 @@ export class BrowserAuth {
     if (this.context) {
       await this.context.close()
     }
-    this.browser = null
     this.context = null
     this.page = null
   }
