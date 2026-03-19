@@ -10,7 +10,8 @@ import { NotificationService, DownloadResult } from './notification'
 import chalk from 'chalk'
 import ora from 'ora'
 
-const MERGE_SIZE = 500 // 每500个文件合并为一个
+const MERGE_SIZE = 300 // 每300个文件合并为一个
+const DOWNLOAD_RECORD_FILE = '.download-record.json' // 下载记录文件
 const DEFAULT_WEBHOOK_URL = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=f543f393-4e15-42f9-90eb-d4b8510e3ba6'
 
 interface DownloadStats {
@@ -22,10 +23,17 @@ interface DownloadStats {
   duration: number
 }
 
+interface DownloadRecord {
+  accountName: string
+  downloadedArticles: Set<string>
+  lastUpdateTime: string
+}
+
 export class ArticleDownloader {
   private api: WeChatAPI
   private downloadDir: string
   private notification: NotificationService
+  private downloadRecords: Map<string, DownloadRecord> = new Map()
 
   constructor(apiKey: string, downloadDir: string, webhookUrl?: string) {
     this.api = new WeChatAPI(apiKey)
@@ -36,39 +44,180 @@ export class ArticleDownloader {
     if (!fs.existsSync(downloadDir)) {
       fs.mkdirSync(downloadDir, { recursive: true })
     }
+
+    // 加载下载记录
+    this.loadDownloadRecords()
+  }
+
+  /**
+   * 加载下载记录
+   */
+  private loadDownloadRecords(): void {
+    const recordPath = path.join(this.downloadDir, DOWNLOAD_RECORD_FILE)
+    try {
+      if (fs.existsSync(recordPath)) {
+        const data = JSON.parse(fs.readFileSync(recordPath, 'utf-8'))
+        for (const [accountName, record] of Object.entries(data)) {
+          const r = record as { downloadedArticles: string[], lastUpdateTime: string }
+          this.downloadRecords.set(accountName, {
+            accountName,
+            downloadedArticles: new Set(r.downloadedArticles),
+            lastUpdateTime: r.lastUpdateTime
+          })
+        }
+        console.log(chalk.gray(`  已加载下载记录: ${this.downloadRecords.size} 个公众号`))
+      }
+    } catch (error) {
+      console.log(chalk.yellow('  加载下载记录失败，将创建新记录'))
+    }
+  }
+
+  /**
+   * 保存下载记录
+   */
+  private saveDownloadRecords(): void {
+    const recordPath = path.join(this.downloadDir, DOWNLOAD_RECORD_FILE)
+    try {
+      const data: Record<string, { downloadedArticles: string[], lastUpdateTime: string }> = {}
+      for (const [accountName, record] of this.downloadRecords) {
+        data[accountName] = {
+          downloadedArticles: Array.from(record.downloadedArticles),
+          lastUpdateTime: record.lastUpdateTime
+        }
+      }
+      fs.writeFileSync(recordPath, JSON.stringify(data, null, 2), 'utf-8')
+    } catch (error) {
+      console.log(chalk.yellow('  保存下载记录失败'))
+    }
+  }
+
+  /**
+   * 检查文章是否已下载
+   */
+  private isArticleDownloaded(accountName: string, articleLink: string): boolean {
+    const record = this.downloadRecords.get(accountName)
+    return record ? record.downloadedArticles.has(articleLink) : false
+  }
+
+  /**
+   * 记录文章已下载
+   */
+  private markArticleDownloaded(accountName: string, articleLink: string): void {
+    let record = this.downloadRecords.get(accountName)
+    if (!record) {
+      record = {
+        accountName,
+        downloadedArticles: new Set(),
+        lastUpdateTime: new Date().toISOString()
+      }
+      this.downloadRecords.set(accountName, record)
+    }
+    record.downloadedArticles.add(articleLink)
+    record.lastUpdateTime = new Date().toISOString()
   }
 
   /**
    * 根据公众号名称搜索并获取精确匹配的公众号
+   * 支持模糊匹配 - 使用 API 层的增强模糊匹配
    */
   async findAccountByName(name: string): Promise<AccountInfo | null> {
     const spinner = ora(`搜索公众号: ${name}`).start()
 
     try {
-      const result = await this.api.searchAccount(name, 0, 20)
+      // 首先使用 API 层的增强模糊匹配
+      const account = await this.api.searchAccountWithFuzzyMatch(name)
 
-      if (result.list && result.list.length > 0) {
-        // 精确匹配名称
-        const exactMatch = result.list.find(
-          account => account.nickname === name || account.alias === name
-        )
+      if (account) {
+        spinner.succeed(`找到公众号: ${account.nickname} (fakeid: ${account.fakeid})`)
+        return account
+      }
 
-        if (exactMatch) {
-          spinner.succeed(`找到公众号: ${exactMatch.nickname} (fakeid: ${exactMatch.fakeid})`)
-          return exactMatch
-        } else {
-          spinner.warn(`未找到精确匹配的公众号 "${name}"`)
-          console.log(chalk.gray(`  搜索结果: ${result.list.map(a => a.nickname).join(', ')}`))
-          return null
+      // 如果 API 层匹配失败，尝试本地备用策略
+      const searchTerms = [
+        name,                              // 原始名称
+        name.replace(/[-_]/g, ''),         // 移除分隔符
+        name.replace(/\s+/g, ''),          // 移除空格
+      ]
+
+      for (const searchTerm of searchTerms) {
+        if (searchTerm === name) continue // 已经尝试过了
+
+        try {
+          const result = await this.api.searchAccount(searchTerm, 0, 50)
+
+          if (result.list && result.list.length > 0) {
+            const fuzzyMatch = this.findBestMatch(name, result.list)
+            if (fuzzyMatch) {
+              spinner.succeed(`找到公众号: ${fuzzyMatch.nickname} (fakeid: ${fuzzyMatch.fakeid})`)
+              return fuzzyMatch
+            }
+          }
+        } catch {
+          // 继续尝试下一个搜索策略
         }
-      } else {
-        spinner.fail(`未找到公众号: ${name}`)
-        return null
       }
     } catch (error) {
-      spinner.fail(`搜索公众号失败: ${name}`)
-      throw error
+      // 忽略错误，返回 null
     }
+
+    spinner.fail(`未找到公众号: ${name}`)
+    return null
+  }
+
+  /**
+   * 从搜索结果中找到最佳匹配（模糊匹配）
+   */
+  private findBestMatch(searchName: string, accounts: AccountInfo[]): AccountInfo | null {
+    const normalizedSearch = this.normalizeName(searchName)
+
+    // 1. 忽略大小写和特殊字符的匹配
+    for (const account of accounts) {
+      const normalizedNickname = this.normalizeName(account.nickname)
+      const normalizedAlias = account.alias ? this.normalizeName(account.alias) : ''
+
+      if (normalizedNickname === normalizedSearch || normalizedAlias === normalizedSearch) {
+        return account
+      }
+    }
+
+    // 2. 包含匹配
+    for (const account of accounts) {
+      const nickname = this.normalizeName(account.nickname)
+      const alias = account.alias ? this.normalizeName(account.alias) : ''
+
+      if (nickname.includes(normalizedSearch) || normalizedSearch.includes(nickname) ||
+          alias.includes(normalizedSearch) || normalizedSearch.includes(alias)) {
+        return account
+      }
+    }
+
+    // 3. 首字符匹配
+    const firstPart = searchName.split(/[-_\s]/)[0]
+    if (firstPart && firstPart.length >= 2) {
+      for (const account of accounts) {
+        if (account.nickname.includes(firstPart) ||
+            (account.alias && account.alias.includes(firstPart))) {
+          return account
+        }
+      }
+    }
+
+    // 4. 如果只有一个结果，直接返回
+    if (accounts.length === 1) {
+      return accounts[0] ?? null
+    }
+
+    return null
+  }
+
+  /**
+   * 标准化名称（移除特殊字符、转小写）
+   */
+  private normalizeName(name: string): string {
+    return name
+      .toLowerCase()
+      .replace(/[-_\s]/g, '')
+      .replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
   }
 
   /**
@@ -108,6 +257,7 @@ export class ArticleDownloader {
     // 下载每篇文章
     let downloaded = 0
     let failed = 0
+    let skipped = 0
 
     for (let i = 0; i < articles.length; i++) {
       const article = articles[i]
@@ -116,12 +266,20 @@ export class ArticleDownloader {
       const progress = `[${i + 1}/${articles.length}]`
 
       try {
+        // 检查下载记录中是否已存在
+        if (this.isArticleDownloaded(account.nickname, article.link)) {
+          skipped++
+          continue
+        }
+
         // 检查文件是否已存在
         const filename = this.generateFilename(article)
         const filePath = path.join(accountDir, filename)
 
         if (fs.existsSync(filePath)) {
           console.log(chalk.gray(`${progress} 跳过已存在: ${article.title}`))
+          // 记录到下载记录
+          this.markArticleDownloaded(account.nickname, article.link)
           downloaded++
           continue
         }
@@ -135,6 +293,9 @@ export class ArticleDownloader {
         // 保存文件
         fs.writeFileSync(filePath, fullContent, 'utf-8')
         console.log(chalk.green(`${progress} ✓ ${article.title}`))
+
+        // 记录到下载记录
+        this.markArticleDownloaded(account.nickname, article.link)
         downloaded++
 
         // 避免请求过快
@@ -145,7 +306,10 @@ export class ArticleDownloader {
       }
     }
 
-    console.log(chalk.cyan(`\n  完成! 成功: ${downloaded}, 失败: ${failed}`))
+    // 保存下载记录
+    this.saveDownloadRecords()
+
+    console.log(chalk.cyan(`\n  完成! 成功: ${downloaded}, 跳过: ${skipped}, 失败: ${failed}`))
 
     // 合并文章
     const mergeResult = await this.mergeAccountArticles(account.nickname)
@@ -162,6 +326,30 @@ export class ArticleDownloader {
   }
 
   /**
+   * 检查公众号是否已完成下载
+   * 通过检查已下载文件数量和记录来判断
+   */
+  private isAccountCompleted(accountName: string): boolean {
+    const record = this.downloadRecords.get(accountName)
+    if (!record) return false
+
+    const accountDir = path.join(this.downloadDir, this.sanitizeFilename(accountName))
+    if (!fs.existsSync(accountDir)) return false
+
+    // 计算已下载的文件数量（排除合并文件）
+    const mdFiles = fs.readdirSync(accountDir)
+      .filter(name => name.endsWith('.md') && !name.includes('+合并'))
+
+    // 如果有超过100个文件且有完整的下载记录，认为已完成
+    // 下载记录中的URL数量应该与文件数量匹配
+    if (mdFiles.length > 100 && record.downloadedArticles.size >= mdFiles.length - 10) {
+      return true
+    }
+
+    return false
+  }
+
+  /**
    * 批量下载多个公众号的文章
    */
   async downloadMultipleAccounts(accountNames: string[]): Promise<void> {
@@ -173,7 +361,34 @@ export class ArticleDownloader {
     const allResults: DownloadResult[] = []
     const results: { name: string; status: string; count: number }[] = []
 
+    // 检查并跳过已完成的公众号
+    const completedAccounts: string[] = []
+    const pendingAccounts: string[] = []
+
     for (const name of accountNames) {
+      if (this.isAccountCompleted(name)) {
+        const record = this.downloadRecords.get(name)
+        const count = record ? record.downloadedArticles.size : 0
+        completedAccounts.push(name)
+        results.push({ name, status: '已完成', count })
+        console.log(chalk.green(`✓ 跳过已完成的公众号: ${name} (${count} 篇文章)`))
+      } else {
+        pendingAccounts.push(name)
+      }
+    }
+
+    if (completedAccounts.length > 0) {
+      console.log(chalk.gray(`\n已跳过 ${completedAccounts.length} 个已完成的公众号\n`))
+    }
+
+    if (pendingAccounts.length === 0) {
+      console.log(chalk.bold.green('\n✨ 所有公众号都已下载完成！\n'))
+      return
+    }
+
+    console.log(chalk.cyan(`待下载公众号: ${pendingAccounts.join(', ')}\n`))
+
+    for (const name of pendingAccounts) {
       const accountStartTime = Date.now()
       try {
         // 搜索公众号
@@ -208,6 +423,13 @@ export class ArticleDownloader {
         console.error(chalk.red(`处理公众号 "${name}" 时出错:`), error)
         results.push({ name, status: '失败', count: 0 })
         await this.notification.sendErrorNotification(name, errorMessage)
+      }
+
+      // 在下载下一个公众号之前，添加随机延迟（5-15秒），避免操作频繁
+      if (results.length < accountNames.length) {
+        const delaySeconds = 5 + Math.random() * 10
+        console.log(chalk.gray(`\n⏳ 等待 ${delaySeconds.toFixed(1)} 秒后继续下载下一个公众号...\n`))
+        await this.delay(Math.floor(delaySeconds * 1000))
       }
     }
 
@@ -264,10 +486,13 @@ export class ArticleDownloader {
 
   /**
    * 合并单个公众号的文章
+   * 合并文件统一输出到项目根目录的 Merge 文件夹
    */
   private async mergeAccountArticles(accountName: string): Promise<{ fileCount: number; totalSize: string }> {
     const accountDir = path.join(this.downloadDir, accountName)
-    const mergedDir = path.join(accountDir, 'merged')
+    // 统一合并目录：项目根目录下的 Merge 文件夹
+    const projectRoot = path.dirname(this.downloadDir)
+    const mergedDir = path.join(projectRoot, 'Merge')
 
     console.log(chalk.cyan(`\n处理公众号: ${accountName}`))
 
@@ -288,14 +513,14 @@ export class ArticleDownloader {
 
     console.log(chalk.gray(`  找到 ${mdFiles.length} 个 Markdown 文件`))
 
-    // 创建合并目录
+    // 创建统一合并目录
     if (!fs.existsSync(mergedDir)) {
       fs.mkdirSync(mergedDir, { recursive: true })
     }
 
-    // 删除之前所有已合并的文件
+    // 删除该公众号之前所有已合并的文件（在统一 Merge 目录中）
     const oldMergedFiles = fs.readdirSync(mergedDir)
-      .filter(name => name.includes('+合并') && name.endsWith('.md'))
+      .filter(name => name.startsWith(accountName) && name.includes('+合并') && name.endsWith('.md'))
 
     if (oldMergedFiles.length > 0) {
       console.log(chalk.gray(`  删除 ${oldMergedFiles.length} 个旧的合并文件...`))
@@ -409,9 +634,11 @@ url: ${article.link}
   }
 
   /**
-   * 延迟函数
+   * 延迟函数（带随机抖动）
    */
-  private delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
+  private delay(ms: number, jitterRatio: number = 0.3): Promise<void> {
+    const jitter = ms * jitterRatio * (Math.random() * 2 - 1)
+    const actualDelay = Math.max(100, Math.floor(ms + jitter))
+    return new Promise(resolve => setTimeout(resolve, actualDelay))
   }
 }

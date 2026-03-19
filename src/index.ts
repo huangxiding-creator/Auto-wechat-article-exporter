@@ -20,6 +20,7 @@ import { ArticleDownloader } from './downloader'
 
 const DEFAULT_ACCOUNT_LIST = '公众号名称列表.txt'
 const DEFAULT_DOWNLOAD_DIR = 'Downloads'
+const API_KEY_FILE = '.api-key'
 
 // 版本信息
 const VERSION = '1.2.0'
@@ -41,6 +42,35 @@ function promptUser(question: string): Promise<string> {
   })
 }
 
+/**
+ * 保存 API 密钥到文件
+ */
+function saveApiKey(apiKey: string): void {
+  try {
+    fs.writeFileSync(API_KEY_FILE, apiKey, 'utf-8')
+    console.log(chalk.gray('  API 密钥已保存到本地'))
+  } catch (error) {
+    console.log(chalk.yellow('  保存 API 密钥失败:', (error as Error).message))
+  }
+}
+
+/**
+ * 从文件加载 API 密钥
+ */
+function loadApiKey(): string | null {
+  try {
+    if (fs.existsSync(API_KEY_FILE)) {
+      const key = fs.readFileSync(API_KEY_FILE, 'utf-8').trim()
+      if (key && key.length >= 20) {
+        return key
+      }
+    }
+  } catch {
+    // 忽略错误
+  }
+  return null
+}
+
 async function main() {
   // 解析命令行参数
   program
@@ -49,6 +79,7 @@ async function main() {
     .option('-o, --output <dir>', '下载目录', DEFAULT_DOWNLOAD_DIR)
     .option('-k, --api-key <key>', 'API 密钥（可选）')
     .option('--manual', '手动输入 API 密钥模式')
+    .option('--skip-browser', '跳过浏览器自动化，直接使用保存的或手动输入的 API 密钥')
     .option('--merge-only', '仅执行合并操作（不下载）')
     .parse(process.argv)
 
@@ -91,10 +122,28 @@ async function main() {
 
     console.log(chalk.gray(`读取到 ${accountNames.length} 个公众号: ${accountNames.join(', ')}\n`))
 
-    // 获取 API 密钥
-    let apiKey = options.apiKey
+    // 获取 API 密钥 (优先级: 命令行参数 > 环境变量 > 本地文件 > 浏览器自动获取)
+    let apiKey = options.apiKey || process.env.WECHAT_API_KEY || loadApiKey()
 
-    if (!apiKey && !options.manual) {
+    // 如果启用了 skip-browser 选项，直接使用手动输入
+    if (options.skipBrowser && !apiKey) {
+      console.log(chalk.cyan('\n📋 跳过浏览器模式 - 请手动输入 API 密钥\n'))
+      console.log(chalk.gray('请按照以下步骤获取 API 密钥:'))
+      console.log(chalk.gray('1. 打开浏览器访问 https://down.mptext.top/dashboard/account'))
+      console.log(chalk.gray('2. 点击 "登录公众号" 并扫码登录'))
+      console.log(chalk.gray('3. 登录成功后访问 https://down.mptext.top/dashboard/api'))
+      console.log(chalk.gray('4. 点击 "查询 API 密钥" 按钮'))
+      console.log(chalk.gray('5. 复制显示的 API 密钥\n'))
+
+      apiKey = await promptUser('请粘贴 API 密钥: ')
+
+      if (!apiKey || apiKey.length < 20) {
+        console.error(chalk.red('错误: API 密钥无效'))
+        process.exit(1)
+      }
+
+      saveApiKey(apiKey)
+    } else if (!apiKey && !options.manual) {
       console.log(chalk.cyan('🔐 正在初始化浏览器...\n'))
 
       const browserAuth = new BrowserAuth()
@@ -122,6 +171,7 @@ async function main() {
 
         if (apiKey) {
           console.log(chalk.green(`✓ API 密钥获取成功: ${apiKey.substring(0, 8)}...${apiKey.substring(apiKey.length - 8)}`))
+          saveApiKey(apiKey)
         }
       } catch (error) {
         console.log(chalk.yellow('\n⚠ 自动获取 API 密钥失败'))
@@ -133,6 +183,9 @@ async function main() {
           console.error(chalk.red('错误: API 密钥无效'))
           process.exit(1)
         }
+
+        // 保存手动输入的 API 密钥
+        saveApiKey(apiKey)
       } finally {
         await browserAuth.close()
       }
@@ -151,6 +204,9 @@ async function main() {
         console.error(chalk.red('错误: API 密钥无效'))
         process.exit(1)
       }
+
+      // 保存手动输入的 API 密钥
+      saveApiKey(apiKey)
     }
 
     if (!apiKey) {

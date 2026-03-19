@@ -28,13 +28,15 @@ export interface Article {
 }
 
 export interface ArticleMessage {
-  app_msg_cnt: number
-  articles: Article[]
+  app_msg_cnt: number  // 文章总数
+  articles: Article[]  // 文章列表
   base_resp: {
     ret: number
     err_msg: string
   }
-  next_offset: number
+  next_offset: number  // 下一页偏移量
+  ret: number
+  err_msg: string
 }
 
 export interface SearchResult {

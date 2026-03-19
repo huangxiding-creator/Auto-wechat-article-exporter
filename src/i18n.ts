@@ -320,7 +320,7 @@ export function t(key: string, locale: Locale = 'zh'): string {
  */
 export function detectLocale(): Locale {
   const envLang = process.env.LANG || process.env.LC_ALL || process.env.LC_MESSAGES || ''
-  const systemLang = envLang.split('_')[0].toLowerCase()
+  const systemLang = (envLang.split('_')[0] || '').toLowerCase()
 
   if (systemLang === 'zh' || systemLang.startsWith('zh')) {
     return 'zh'
