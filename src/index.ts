@@ -104,7 +104,7 @@ async function checkApiKeyValid(apiKey: string): Promise<boolean> {
  * 打开浏览器让用户获取 API Key
  */
 function openBrowserForApiKey(): void {
-  const url = 'https://down.mptext.top/dashboard/api'
+  const url = 'https://down.mptext.top/dashboard/account'
   console.log(chalk.cyan('\n🌐 正在打开浏览器...'))
   console.log(chalk.yellow('请在浏览器中扫码登录，然后复制 API 密钥'))
   const command = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open'
