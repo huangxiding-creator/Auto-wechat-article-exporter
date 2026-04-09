@@ -12,6 +12,7 @@ import ora from 'ora'
 
 const MERGE_SIZE = 300 // 每300个文件合并为一个
 const DOWNLOAD_RECORD_FILE = '.download-record.json' // 下载记录文件
+const MERGE_RECORD_FILE = '.merge-record.json' // 合并记录文件
 const DEFAULT_WEBHOOK_URL = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=f543f393-4e15-42f9-90eb-d4b8510e3ba6'
 
 interface DownloadStats {
@@ -29,16 +30,33 @@ interface DownloadRecord {
   lastUpdateTime: string
 }
 
+interface AccountMergeRecord {
+  mergedFiles: Set<string>  // 已合并的文件名
+  lastMergeIndex: number    // 最后一个合并文件的序号
+  lastMergeCount: number    // 最后一个合并文件中的文章数
+}
+
+interface MergeRecordData {
+  [accountName: string]: {
+    mergedFiles: string[]
+    lastMergeIndex: number
+    lastMergeCount: number
+  }
+}
+
 export class ArticleDownloader {
   private api: WeChatAPI
   private downloadDir: string
   private notification: NotificationService
   private downloadRecords: Map<string, DownloadRecord> = new Map()
+  private mergeRecords: Map<string, AccountMergeRecord> = new Map()
+  private mergedDir: string
 
   constructor(apiKey: string, downloadDir: string, webhookUrl?: string) {
     this.api = new WeChatAPI(apiKey)
     this.downloadDir = downloadDir
     this.notification = new NotificationService(webhookUrl || DEFAULT_WEBHOOK_URL)
+    this.mergedDir = path.join(path.dirname(downloadDir), 'Merge')
 
     // 确保下载目录存在
     if (!fs.existsSync(downloadDir)) {
@@ -47,6 +65,8 @@ export class ArticleDownloader {
 
     // 加载下载记录
     this.loadDownloadRecords()
+    // 加载合并记录
+    this.loadMergeRecords()
   }
 
   /**
@@ -88,6 +108,50 @@ export class ArticleDownloader {
       fs.writeFileSync(recordPath, JSON.stringify(data, null, 2), 'utf-8')
     } catch (error) {
       console.log(chalk.yellow('  保存下载记录失败'))
+    }
+  }
+
+  /**
+   * 加载合并记录
+   */
+  private loadMergeRecords(): void {
+    const recordPath = path.join(this.mergedDir, MERGE_RECORD_FILE)
+    try {
+      if (fs.existsSync(recordPath)) {
+        const data: MergeRecordData = JSON.parse(fs.readFileSync(recordPath, 'utf-8'))
+        for (const [accountName, record] of Object.entries(data)) {
+          this.mergeRecords.set(accountName, {
+            mergedFiles: new Set(record.mergedFiles),
+            lastMergeIndex: record.lastMergeIndex,
+            lastMergeCount: record.lastMergeCount
+          })
+        }
+      }
+    } catch (error) {
+      // 合并记录加载失败不影响运行
+    }
+  }
+
+  /**
+   * 保存合并记录
+   */
+  private saveMergeRecords(): void {
+    if (!fs.existsSync(this.mergedDir)) {
+      fs.mkdirSync(this.mergedDir, { recursive: true })
+    }
+    const recordPath = path.join(this.mergedDir, MERGE_RECORD_FILE)
+    try {
+      const data: MergeRecordData = {}
+      for (const [accountName, record] of this.mergeRecords) {
+        data[accountName] = {
+          mergedFiles: Array.from(record.mergedFiles),
+          lastMergeIndex: record.lastMergeIndex,
+          lastMergeCount: record.lastMergeCount
+        }
+      }
+      fs.writeFileSync(recordPath, JSON.stringify(data, null, 2), 'utf-8')
+    } catch (error) {
+      console.log(chalk.yellow('  保存合并记录失败'))
     }
   }
 
@@ -254,55 +318,64 @@ export class ArticleDownloader {
       return { total: 0, downloaded: 0, failed: 0, mergedFiles: 0, mergedSize: '0 KB', duration: 0 }
     }
 
-    // 下载每篇文章
+    // 并发下载文章（安全加速）
     let downloaded = 0
     let failed = 0
     let skipped = 0
+    const CONCURRENCY = 1 // 串行下载，避免触发限流
 
-    for (let i = 0; i < articles.length; i++) {
-      const article = articles[i]
-      if (!article) continue
-
-      const progress = `[${i + 1}/${articles.length}]`
-
-      try {
-        // 检查下载记录中是否已存在
-        if (this.isArticleDownloaded(account.nickname, article.link)) {
-          skipped++
-          continue
-        }
-
-        // 检查文件是否已存在
-        const filename = this.generateFilename(article)
-        const filePath = path.join(accountDir, filename)
-
-        if (fs.existsSync(filePath)) {
-          console.log(chalk.gray(`${progress} 跳过已存在: ${article.title}`))
-          // 记录到下载记录
-          this.markArticleDownloaded(account.nickname, article.link)
-          downloaded++
-          continue
-        }
-
-        // 下载文章内容
-        const content = await this.api.downloadArticle(article.link, { format: 'markdown' })
-
-        // 添加元信息
-        const fullContent = this.addMetadata(article, content)
-
-        // 保存文件
-        fs.writeFileSync(filePath, fullContent, 'utf-8')
-        console.log(chalk.green(`${progress} ✓ ${article.title}`))
-
-        // 记录到下载记录
+    // 过滤已下载的文章
+    const pendingArticles = articles.filter(article => {
+      if (!article) return false
+      if (this.isArticleDownloaded(account.nickname, article.link)) {
+        skipped++
+        return false
+      }
+      const filename = this.generateFilename(article)
+      const filePath = path.join(accountDir, filename)
+      if (fs.existsSync(filePath)) {
         this.markArticleDownloaded(account.nickname, article.link)
         downloaded++
+        return false
+      }
+      return true
+    })
 
-        // 避免请求过快
-        await this.delay(300)
+    console.log(chalk.gray(`  待下载: ${pendingArticles.length} 篇, 已跳过: ${skipped + downloaded} 篇`))
+
+    // 并发下载处理函数
+    const downloadArticle = async (article: Article, index: number): Promise<void> => {
+      const progress = `[${index + 1}/${articles.length}]`
+      const filename = this.generateFilename(article)
+      const filePath = path.join(accountDir, filename)
+
+      try {
+        const content = await this.api.downloadArticle(article.link, { format: 'markdown' })
+        const fullContent = this.addMetadata(article, content)
+        fs.writeFileSync(filePath, fullContent, 'utf-8')
+        console.log(chalk.green(`${progress} ✓ ${article.title}`))
+        this.markArticleDownloaded(account.nickname, article.link)
+        downloaded++
       } catch (error) {
         console.log(chalk.red(`${progress} ✗ 下载失败: ${article.title}`))
         failed++
+      }
+    }
+
+    // 分批并发执行
+    for (let i = 0; i < pendingArticles.length; i += CONCURRENCY) {
+      const batch = pendingArticles.slice(i, i + CONCURRENCY)
+      const startIndex = articles.indexOf(batch[0]!)
+
+      await Promise.all(
+        batch.map((article, batchIndex) =>
+          downloadArticle(article, startIndex + batchIndex)
+        )
+      )
+
+      // 批次间延迟，保护API
+      if (i + CONCURRENCY < pendingArticles.length) {
+        await this.delay(1000)
       }
     }
 
@@ -340,9 +413,10 @@ export class ArticleDownloader {
     const mdFiles = fs.readdirSync(accountDir)
       .filter(name => name.endsWith('.md') && !name.includes('+合并'))
 
-    // 如果有超过100个文件且有完整的下载记录，认为已完成
-    // 下载记录中的URL数量应该与文件数量匹配
-    if (mdFiles.length > 100 && record.downloadedArticles.size >= mdFiles.length - 10) {
+    // 如果有超过100个文件，且下载记录中的URL数量接近文件数量（差距<50）
+    // 说明大部分文章已下载，且上次下载成功完成（非中途失败）
+    // 注意：如果上次有很多失败（文件数远小于API返回总数），需要重新下载
+    if (mdFiles.length > 100 && record.downloadedArticles.size >= mdFiles.length - 50 && record.downloadedArticles.size < mdFiles.length + 50) {
       return true
     }
 
@@ -485,69 +559,102 @@ export class ArticleDownloader {
   }
 
   /**
-   * 合并单个公众号的文章
-   * 合并文件统一输出到项目根目录的 Merge 文件夹
+   * 合并单个公众号的文章（增量合并）
+   * 只合并新增的文章，追加到最后一个合并文件或创建新文件
    */
   private async mergeAccountArticles(accountName: string): Promise<{ fileCount: number; totalSize: string }> {
     const accountDir = path.join(this.downloadDir, accountName)
-    // 统一合并目录：项目根目录下的 Merge 文件夹
-    const projectRoot = path.dirname(this.downloadDir)
-    const mergedDir = path.join(projectRoot, 'Merge')
 
     console.log(chalk.cyan(`\n处理公众号: ${accountName}`))
 
-    // 获取所有 .md 文件（排除已合并的）
-    const mdFiles = fs.readdirSync(accountDir)
+    // 获取所有 .md 文件（排除合并文件）
+    const allMdFiles = fs.readdirSync(accountDir)
       .filter(name => name.endsWith('.md') && !name.includes('+合并'))
       .map(name => ({
         name,
         path: path.join(accountDir, name),
         mtime: fs.statSync(path.join(accountDir, name)).mtime
       }))
-      .sort((a, b) => b.mtime.getTime() - a.mtime.getTime()) // 按修改时间降序
+      .sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
 
-    if (mdFiles.length === 0) {
+    if (allMdFiles.length === 0) {
       console.log(chalk.gray(`  没有 Markdown 文件需要合并`))
       return { fileCount: 0, totalSize: '0 KB' }
     }
 
-    console.log(chalk.gray(`  找到 ${mdFiles.length} 个 Markdown 文件`))
+    // 获取合并记录，筛选出未合并的新文件
+    const mergeRec = this.mergeRecords.get(accountName)
+    const newFiles = mergeRec
+      ? allMdFiles.filter(f => !mergeRec.mergedFiles.has(f.name))
+      : allMdFiles
 
-    // 创建统一合并目录
-    if (!fs.existsSync(mergedDir)) {
-      fs.mkdirSync(mergedDir, { recursive: true })
+    if (newFiles.length === 0) {
+      console.log(chalk.gray(`  找到 ${allMdFiles.length} 个文件，无新增需合并`))
+      return { fileCount: 0, totalSize: '0 KB' }
     }
 
-    // 删除该公众号之前所有已合并的文件（在统一 Merge 目录中）
-    const oldMergedFiles = fs.readdirSync(mergedDir)
+    console.log(chalk.gray(`  找到 ${allMdFiles.length} 个文件，${newFiles.length} 个新增需合并`))
+
+    // 创建合并目录
+    if (!fs.existsSync(this.mergedDir)) {
+      fs.mkdirSync(this.mergedDir, { recursive: true })
+    }
+
+    let totalSizeBytes = 0
+    let newMergeFilesCreated = 0
+
+    if (!mergeRec || mergeRec.lastMergeIndex === 0) {
+      // 首次合并：全量处理
+      const result = await this.fullMerge(accountName, allMdFiles)
+      totalSizeBytes = result.totalSizeBytes
+      newMergeFilesCreated = result.fileCount
+    } else {
+      // 增量合并：追加新文件
+      const result = await this.incrementalMerge(accountName, newFiles, mergeRec)
+      totalSizeBytes = result.totalSizeBytes
+      newMergeFilesCreated = result.fileCount
+    }
+
+    return {
+      fileCount: newMergeFilesCreated,
+      totalSize: totalSizeBytes > 1024 * 1024
+        ? `${(totalSizeBytes / 1024 / 1024).toFixed(2)} MB`
+        : `${(totalSizeBytes / 1024).toFixed(1)} KB`
+    }
+  }
+
+  /**
+   * 全量合并（首次或无记录时）
+   */
+  private async fullMerge(accountName: string, mdFiles: Array<{ name: string; path: string; mtime: Date }>): Promise<{ fileCount: number; totalSizeBytes: number }> {
+    // 删除旧的合并文件
+    const oldMergedFiles = fs.readdirSync(this.mergedDir)
       .filter(name => name.startsWith(accountName) && name.includes('+合并') && name.endsWith('.md'))
 
     if (oldMergedFiles.length > 0) {
       console.log(chalk.gray(`  删除 ${oldMergedFiles.length} 个旧的合并文件...`))
       for (const file of oldMergedFiles) {
-        fs.unlinkSync(path.join(mergedDir, file))
+        fs.unlinkSync(path.join(this.mergedDir, file))
       }
     }
 
-    // 计算需要合并成多少个文件
     const totalFiles = mdFiles.length
     const mergeCount = Math.ceil(totalFiles / MERGE_SIZE)
+    console.log(chalk.gray(`  首次合并，将合并为 ${mergeCount} 个文件`))
 
-    console.log(chalk.gray(`  将合并为 ${mergeCount} 个文件 (每${MERGE_SIZE}个文件合并)`))
-
-    // 分批合并
     let totalSizeBytes = 0
+    const mergedFileNames = new Set<string>()
+
     for (let i = 0; i < mergeCount; i++) {
       const start = i * MERGE_SIZE
       const end = Math.min(start + MERGE_SIZE, totalFiles)
       const batchFiles = mdFiles.slice(start, end)
 
       const mergedFileName = `${accountName}+合并${i + 1}.md`
-      const mergedFilePath = path.join(mergedDir, mergedFileName)
+      const mergedFilePath = path.join(this.mergedDir, mergedFileName)
 
       console.log(chalk.gray(`  合并第 ${i + 1}/${mergeCount} 批 (${batchFiles.length} 个文件)...`))
 
-      // 构建合并内容
       const header = this.generateMergeHeader(accountName, i + 1, mergeCount, batchFiles.length)
       const contents: string[] = [header]
 
@@ -555,25 +662,139 @@ export class ArticleDownloader {
         try {
           const content = fs.readFileSync(file.path, 'utf-8')
           contents.push(content)
-          contents.push('\n\n---\n\n') // 分隔符
+          contents.push('\n\n---\n\n')
         } catch (error) {
           console.log(chalk.yellow(`  警告: 无法读取文件 ${file.name}`))
         }
+        mergedFileNames.add(file.name)
       }
 
-      // 写入合并文件
       fs.writeFileSync(mergedFilePath, contents.join('\n'), 'utf-8')
       const fileSize = (contents.join('\n').length / 1024).toFixed(1)
       console.log(chalk.green(`  ✓ 已创建: ${mergedFileName} (${fileSize} KB)`))
       totalSizeBytes += contents.join('\n').length
     }
 
-    return {
-      fileCount: mergeCount,
-      totalSize: totalSizeBytes > 1024 * 1024
-        ? `${(totalSizeBytes / 1024 / 1024).toFixed(2)} MB`
-        : `${(totalSizeBytes / 1024).toFixed(1)} KB`
+    // 更新合并记录
+    this.mergeRecords.set(accountName, {
+      mergedFiles: mergedFileNames,
+      lastMergeIndex: mergeCount,
+      lastMergeCount: totalFiles % MERGE_SIZE === 0 ? MERGE_SIZE : totalFiles % MERGE_SIZE
+    })
+    this.saveMergeRecords()
+
+    return { fileCount: mergeCount, totalSizeBytes }
+  }
+
+  /**
+   * 增量合并（追加新文章）
+   */
+  private async incrementalMerge(
+    accountName: string,
+    newFiles: Array<{ name: string; path: string; mtime: Date }>,
+    mergeRec: AccountMergeRecord
+  ): Promise<{ fileCount: number; totalSizeBytes: number }> {
+    let remaining = [...newFiles]
+    let totalSizeBytes = 0
+    let filesCreated = 0
+    const allNewMergedNames = new Set<string>()
+
+    // 如果最后一个合并文件未满，追加到该文件
+    if (mergeRec.lastMergeCount < MERGE_SIZE) {
+      const spaceInLast = MERGE_SIZE - mergeRec.lastMergeCount
+      const toAppend = remaining.slice(0, spaceInLast)
+      remaining = remaining.slice(spaceInLast)
+
+      const lastFileName = `${accountName}+合并${mergeRec.lastMergeIndex}.md`
+      const lastFilePath = path.join(this.mergedDir, lastFileName)
+
+      if (fs.existsSync(lastFilePath) && toAppend.length > 0) {
+        console.log(chalk.gray(`  追加 ${toAppend.length} 篇到最后一个合并文件 ${lastFileName}...`))
+
+        // 读取现有内容
+        let existingContent = fs.readFileSync(lastFilePath, 'utf-8')
+
+        // 追加新文章
+        const appendParts: string[] = []
+        for (const file of toAppend) {
+          try {
+            const content = fs.readFileSync(file.path, 'utf-8')
+            appendParts.push(content)
+            appendParts.push('\n\n---\n\n')
+          } catch (error) {
+            console.log(chalk.yellow(`  警告: 无法读取文件 ${file.name}`))
+          }
+          allNewMergedNames.add(file.name)
+        }
+
+        const appendedContent = existingContent + appendParts.join('\n')
+        const newCount = mergeRec.lastMergeCount + toAppend.length
+
+        // 更新头部信息中的文件数
+        const updatedHeader = this.generateMergeHeader(accountName, mergeRec.lastMergeIndex, mergeRec.lastMergeIndex, newCount)
+        // 替换header部分（从开头到第一个正文内容）
+        const headerEndMarker = '\n---\n\n'
+        const headerEndIndex = appendedContent.indexOf(headerEndMarker)
+        if (headerEndIndex !== -1) {
+          const afterHeader = appendedContent.substring(headerEndIndex + headerEndMarker.length)
+          const finalContent = updatedHeader + afterHeader
+          fs.writeFileSync(lastFilePath, finalContent, 'utf-8')
+          const fileSize = (finalContent.length / 1024).toFixed(1)
+          console.log(chalk.green(`  ✓ 已更新: ${lastFileName} (${fileSize} KB)`))
+          totalSizeBytes += finalContent.length
+        } else {
+          // 无法定位header，直接追加
+          fs.writeFileSync(lastFilePath, appendedContent, 'utf-8')
+          totalSizeBytes += appendedContent.length
+        }
+
+        mergeRec.lastMergeCount = newCount
+      }
     }
+
+    // 如果还有剩余文件，创建新的合并文件
+    while (remaining.length > 0) {
+      const batch = remaining.slice(0, MERGE_SIZE)
+      remaining = remaining.slice(MERGE_SIZE)
+
+      const newIndex = mergeRec.lastMergeIndex + 1
+      const mergedFileName = `${accountName}+合并${newIndex}.md`
+      const mergedFilePath = path.join(this.mergedDir, mergedFileName)
+
+      // 计算总文件数（用于header显示）
+      const totalCount = newIndex
+      console.log(chalk.gray(`  创建新合并文件 ${mergedFileName} (${batch.length} 个文件)...`))
+
+      const header = this.generateMergeHeader(accountName, newIndex, totalCount, batch.length)
+      const contents: string[] = [header]
+
+      for (const file of batch) {
+        try {
+          const content = fs.readFileSync(file.path, 'utf-8')
+          contents.push(content)
+          contents.push('\n\n---\n\n')
+        } catch (error) {
+          console.log(chalk.yellow(`  警告: 无法读取文件 ${file.name}`))
+        }
+        allNewMergedNames.add(file.name)
+      }
+
+      fs.writeFileSync(mergedFilePath, contents.join('\n'), 'utf-8')
+      const fileSize = (contents.join('\n').length / 1024).toFixed(1)
+      console.log(chalk.green(`  ✓ 已创建: ${mergedFileName} (${fileSize} KB)`))
+      totalSizeBytes += contents.join('\n').length
+      filesCreated++
+
+      mergeRec.lastMergeIndex = newIndex
+      mergeRec.lastMergeCount = batch.length
+    }
+
+    // 更新合并记录
+    mergeRec.mergedFiles = new Set([...mergeRec.mergedFiles, ...allNewMergedNames])
+    this.mergeRecords.set(accountName, mergeRec)
+    this.saveMergeRecords()
+
+    return { fileCount: filesCreated, totalSizeBytes }
   }
 
   /**

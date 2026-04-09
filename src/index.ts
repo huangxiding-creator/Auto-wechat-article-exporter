@@ -10,11 +10,17 @@
  * 5. 下载完成后，合并 Markdown 文件（每500个文件合并为一个）
  */
 
+// 加载环境变量
+import * as dotenv from 'dotenv'
+dotenv.config()
+
 import * as fs from 'fs'
 import * as path from 'path'
 import * as readline from 'readline'
+import { exec } from 'child_process'
 import { program } from 'commander'
 import chalk from 'chalk'
+import axios from 'axios'
 import { BrowserAuth } from './browser'
 import { ArticleDownloader } from './downloader'
 
@@ -69,6 +75,44 @@ function loadApiKey(): string | null {
     // 忽略错误
   }
   return null
+}
+
+/**
+ * 检查 API Key 是否有效
+ */
+async function checkApiKeyValid(apiKey: string): Promise<boolean> {
+  try {
+    const response = await axios.get('https://down.mptext.top/api/public/v1/account', {
+      params: { keyword: 'test', begin: 0, size: 1 },
+      headers: {
+        'X-Auth-Key': apiKey,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      timeout: 15000
+    })
+    const data = response.data
+    // 有效响应应该是 JSON 对象，不是 HTML
+    if (typeof data === 'string' && data.includes('<!DOCTYPE')) return false
+    if (data?.base_resp?.ret === -1) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 打开浏览器让用户获取 API Key
+ */
+function openBrowserForApiKey(): void {
+  const url = 'https://down.mptext.top/dashboard/api'
+  console.log(chalk.cyan('\n🌐 正在打开浏览器...'))
+  console.log(chalk.yellow('请在浏览器中扫码登录，然后复制 API 密钥'))
+  const command = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open'
+  exec(`${command} "${url}"`, (err) => {
+    if (err) {
+      console.log(chalk.yellow(`无法自动打开浏览器，请手动访问: ${url}`))
+    }
+  })
 }
 
 async function main() {
@@ -214,14 +258,32 @@ async function main() {
       process.exit(1)
     }
 
+    // 检查 API Key 是否有效
+    console.log(chalk.cyan('🔑 正在验证 API 密钥...'))
+    const isValid = await checkApiKeyValid(apiKey)
+    if (!isValid) {
+      console.log(chalk.red('✗ API 密钥已失效或无效'))
+      openBrowserForApiKey()
+      apiKey = await promptUser('\n请输入新的 API 密钥: ')
+      if (!apiKey || apiKey.length < 20) {
+        console.error(chalk.red('错误: API 密钥无效'))
+        process.exit(1)
+      }
+      saveApiKey(apiKey)
+      // 再次验证
+      const recheck = await checkApiKeyValid(apiKey)
+      if (!recheck) {
+        console.error(chalk.red('错误: 新的 API 密钥仍然无效，请确认后重试'))
+        process.exit(1)
+      }
+    }
+    console.log(chalk.green('✓ API 密钥验证通过'))
+
     // 初始化下载器
     const downloader = new ArticleDownloader(apiKey, downloadDir)
 
-    // 1. 首先下载所有文章
+    // 1. 首先下载所有文章（每个账号下载完会自动增量合并）
     await downloader.downloadMultipleAccounts(accountNames)
-
-    // 2. 下载完成后执行合并操作
-    await downloader.mergeAllArticles()
 
     console.log(chalk.bold.green('\n✨ 全部完成！\n'))
     console.log(chalk.gray(`文章已保存到: ${downloadDir}\n`))

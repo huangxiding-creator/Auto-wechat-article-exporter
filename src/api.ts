@@ -1,12 +1,15 @@
 /**
  * 微信公众号文章导出器 - API 客户端
- * V2.0 - 增强版：重试机制、模糊搜索、完整分页
+ * V3.0 - 生产级：断路器、速率限制、结构化日志
  */
 
 import axios, { AxiosInstance, AxiosError } from 'axios'
 import { AccountInfo, ArticleMessage, SearchResult, DownloadOptions } from './types'
+import { RateLimiter, CircuitBreaker, CircuitState } from './rate-limiter'
+import { logger } from './structured-logger'
+import { config } from './config'
 
-const BASE_URL = 'https://down.mptext.top'
+const BASE_URL = config.getSection('api').baseUrl
 
 interface RetryConfig {
   maxRetries: number
@@ -15,26 +18,39 @@ interface RetryConfig {
 }
 
 const DEFAULT_RETRY_CONFIG: RetryConfig = {
-  maxRetries: 5,
-  baseDelay: 1000,
-  maxDelay: 30000
+  maxRetries: config.getSection('api').maxRetries,
+  baseDelay: config.getSection('api').baseDelay,
+  maxDelay: config.getSection('api').maxDelay
 }
 
 export class WeChatAPI {
   private client: AxiosInstance
   private retryConfig: RetryConfig
   private warmupDone = false
+  private currentDelay = 2000 // 自适应延迟，初始2秒
+  private consecutive429 = 0 // 连续429错误计数
+  private rateLimiter: RateLimiter
+  private circuitBreaker: CircuitBreaker
 
   constructor(apiKey: string, retryConfig?: Partial<RetryConfig>) {
     this.retryConfig = { ...DEFAULT_RETRY_CONFIG, ...retryConfig }
     this.client = axios.create({
       baseURL: BASE_URL,
-      timeout: 30000, // 30秒超时
+      timeout: config.getSection('api').timeout,
       headers: {
         'X-Auth-Key': apiKey,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     })
+
+    // 初始化速率限制器和断路器
+    const rateLimitConfig = config.getSection('rateLimit')
+    this.rateLimiter = new RateLimiter(rateLimitConfig)
+
+    const circuitConfig = config.getSection('circuitBreaker')
+    this.circuitBreaker = new CircuitBreaker(circuitConfig)
+
+    logger.debug('API 客户端初始化完成', { baseUrl: BASE_URL })
   }
 
   /**
@@ -62,21 +78,50 @@ export class WeChatAPI {
   }
 
   /**
-   * 带重试的请求包装器
+   * 带重试的请求包装器（集成断路器和速率限制）
    */
   private async withRetry<T>(
     operation: () => Promise<T>,
     operationName: string,
     config: Partial<RetryConfig> = {}
   ): Promise<T> {
-    const { maxRetries, baseDelay, maxDelay } = { ...this.retryConfig, ...config }
+    const { maxRetries, maxDelay } = { ...this.retryConfig, ...config }
     let lastError: Error | null = null
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      // 检查断路器状态
+      if (!this.circuitBreaker.canExecute()) {
+        throw new Error(`${operationName}: 服务暂时不可用（断路器断开）`)
+      }
+
+      // 等待速率限制
+      await this.rateLimiter.waitForSlot()
+
       try {
-        return await operation()
+        const result = await operation()
+
+        // 成功：报告给速率限制器和断路器
+        this.rateLimiter.reportSuccess()
+        this.circuitBreaker.reportSuccess()
+        this.consecutive429 = 0
+        this.currentDelay = Math.max(1000, this.currentDelay * 0.9)
+
+        logger.debug(`${operationName} 成功`)
+        return result
       } catch (error) {
         lastError = error as Error
+
+        // 检测429限流错误
+        if (error instanceof AxiosError && error.response?.status === 429) {
+          this.rateLimiter.report429()
+          this.circuitBreaker.reportFailure()
+          this.consecutive429++
+          this.currentDelay = Math.min(10000, this.currentDelay * 2)
+          logger.warn(`${operationName}: 限流检测`, { attempt: attempt + 1, delay: this.currentDelay })
+        } else {
+          this.rateLimiter.reportError()
+          this.circuitBreaker.reportFailure()
+        }
 
         // 如果是4xx错误（除了429），不重试
         if (error instanceof AxiosError && error.response) {
@@ -87,12 +132,14 @@ export class WeChatAPI {
         }
 
         if (attempt < maxRetries) {
-          // 指数退避 + 随机抖动
           const delay = Math.min(
-            baseDelay * Math.pow(2, attempt) + Math.random() * 1000,
+            this.currentDelay * Math.pow(1.5, attempt) + Math.random() * 500,
             maxDelay
           )
-          console.log(`  ${operationName} 失败 (尝试 ${attempt + 1}/${maxRetries + 1})，${Math.floor(delay / 1000)}秒后重试...`)
+          logger.warn(`${operationName} 失败，${Math.floor(delay / 1000)}秒后重试`, {
+            attempt: attempt + 1,
+            maxRetries: maxRetries + 1
+          })
           await this.delay(delay)
         }
       }
@@ -306,8 +353,9 @@ export class WeChatAPI {
             hasMore = false
           }
 
-          // 随机延迟，避免请求过快（增加到4-6秒）
-          await this.delay(5000, 0.2)
+          // 自适应延迟：根据当前状态动态调整
+          // 如果连续遇到429，currentDelay会自动增加
+          await this.delay(this.currentDelay, 0.2)
         } else {
           // 空结果，可能是真的没有了
           if (pageCount === 1) {
@@ -376,6 +424,65 @@ export class WeChatAPI {
       },
       '获取公众号信息'
     )
+  }
+
+  /**
+   * 健康检查
+   */
+  async healthCheck(): Promise<{
+    status: 'healthy' | 'degraded' | 'unhealthy'
+    circuitBreaker: CircuitState
+    rateLimiter: { delay: number; consecutive429: number }
+    latency?: number
+  }> {
+    const circuitState = this.circuitBreaker.getState()
+    const rateLimitStatus = this.rateLimiter.getStatus()
+
+    let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy'
+    let latency: number | undefined
+
+    // 测试 API 连通性
+    try {
+      const start = Date.now()
+      await this.client.get('/api/public/v1/account', {
+        params: { keyword: 'test', begin: 0, size: 1 },
+        timeout: 5000
+      })
+      latency = Date.now() - start
+    } catch {
+      status = 'unhealthy'
+    }
+
+    // 根据断路器状态调整
+    if (circuitState === CircuitState.OPEN) {
+      status = 'unhealthy'
+    } else if (circuitState === CircuitState.HALF_OPEN) {
+      status = 'degraded'
+    }
+
+    // 根据速率限制状态调整
+    if (rateLimitStatus.consecutive429 >= 3) {
+      status = status === 'healthy' ? 'degraded' : status
+    }
+
+    return {
+      status,
+      circuitBreaker: circuitState,
+      rateLimiter: rateLimitStatus,
+      latency
+    }
+  }
+
+  /**
+   * 重置所有状态
+   */
+  reset(): void {
+    this.circuitBreaker.reset()
+    this.rateLimiter.reset()
+    this.currentDelay = 2000
+    this.consecutive429 = 0
+    this.warmupDone = false
+    logger.info('API 客户端状态已重置')
   }
 
   /**
