@@ -122,9 +122,11 @@ async function main() {
     .option('-a, --account-list <file>', '公众号名称列表文件', DEFAULT_ACCOUNT_LIST)
     .option('-o, --output <dir>', '下载目录', DEFAULT_DOWNLOAD_DIR)
     .option('-k, --api-key <key>', 'API 密钥（可选）')
+    .option('-p, --port <number>', 'Web 界面端口', '3000')
     .option('--manual', '手动输入 API 密钥模式')
     .option('--skip-browser', '跳过浏览器自动化，直接使用保存的或手动输入的 API 密钥')
     .option('--merge-only', '仅执行合并操作（不下载）')
+    .option('--web', '启动 Web 可视化界面模式')
     .parse(process.argv)
 
   const options = program.opts()
@@ -132,6 +134,16 @@ async function main() {
   console.log(chalk.bold.cyan('\n╔══════════════════════════════════════════════╗'))
   console.log(chalk.bold.cyan('║    微信公众号文章批量下载器 v' + VERSION + '          ║'))
   console.log(chalk.bold.cyan('╚══════════════════════════════════════════════╝\n'))
+
+  // Web 可视化界面模式（不影响纯脚本模式）
+  if (options.web) {
+    const { createWebServer } = require('./web/server')
+    const port = parseInt(options.port, 10) || 3000
+    createWebServer(port)
+    console.log(chalk.green('  Web 可视化界面已启动，浏览器将自动打开'))
+    console.log(chalk.gray('  纯脚本模式请使用: npm start (不加 --web)'))
+    return
+  }
 
   try {
     const downloadDir = path.resolve(options.output)

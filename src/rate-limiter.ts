@@ -12,11 +12,11 @@ export interface RateLimiterConfig {
 }
 
 const DEFAULT_CONFIG: RateLimiterConfig = {
-  maxRequests: 10,          // 每分钟10个请求（更保守）
+  maxRequests: 30,          // 每分钟30个请求
   windowMs: 60000,          // 1分钟窗口
-  minDelay: 1000,           // 最小1秒延迟
+  minDelay: 300,            // 最小0.3秒延迟
   maxDelay: 30000,          // 最大30秒延迟
-  backoffMultiplier: 1.5    // 退避乘数（更温和）
+  backoffMultiplier: 1.5    // 退避乘数
 }
 
 export class RateLimiter {

@@ -58,16 +58,16 @@ const DEFAULT_CONFIG: AppConfig = {
     maxDelay: 30000
   },
   download: {
-    concurrency: 1,
+    concurrency: 5,
     mergeSize: 300,
     downloadDir: 'Downloads',
     mergeDir: 'Merge',
     recordFile: '.download-record.json'
   },
   rateLimit: {
-    maxRequests: 10,
+    maxRequests: 30,
     windowMs: 60000,
-    minDelay: 1000,
+    minDelay: 300,
     maxDelay: 30000
   },
   circuitBreaker: {

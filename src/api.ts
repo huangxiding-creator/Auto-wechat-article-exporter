@@ -27,7 +27,7 @@ export class WeChatAPI {
   private client: AxiosInstance
   private retryConfig: RetryConfig
   private warmupDone = false
-  private currentDelay = 2000 // 自适应延迟，初始2秒
+  private currentDelay = 500 // 自适应延迟（速率限制器控制节奏）
   private consecutive429 = 0 // 连续429错误计数
   private rateLimiter: RateLimiter
   private circuitBreaker: CircuitBreaker
@@ -104,7 +104,7 @@ export class WeChatAPI {
         this.rateLimiter.reportSuccess()
         this.circuitBreaker.reportSuccess()
         this.consecutive429 = 0
-        this.currentDelay = Math.max(1000, this.currentDelay * 0.9)
+        this.currentDelay = Math.max(300, this.currentDelay * 0.9)
 
         logger.debug(`${operationName} 成功`)
         return result
@@ -289,10 +289,10 @@ export class WeChatAPI {
     const allArticles: ArticleMessage['articles'] = []
     const articleMap = new Map<string, boolean>() // 用于去重
     let begin = 0
-    const size = 20
+    const size = 50 // 每页50篇，减少API请求次数（最大优化）
     let hasMore = true
     let pageCount = 0
-    const maxPages = 1000 // 增加到1000页，支持最多20000篇文章
+    const maxPages = 1000 // 支持最多50000篇文章（每页50）
     let totalCount = 0
     let consecutiveErrors = 0
     const maxConsecutiveErrors = 5 // 连续5次错误才放弃
@@ -353,9 +353,7 @@ export class WeChatAPI {
             hasMore = false
           }
 
-          // 自适应延迟：根据当前状态动态调整
-          // 如果连续遇到429，currentDelay会自动增加
-          await this.delay(this.currentDelay, 0.2)
+          // 延迟由速率限制器 waitForSlot() 控制，无需额外等待
         } else {
           // 空结果，可能是真的没有了
           if (pageCount === 1) {
@@ -374,7 +372,7 @@ export class WeChatAPI {
 
         // 继续尝试下一页，但等待更长时间
         begin += size
-        await this.delay(3000, 0.3) // 失败后等待更长时间
+        await this.delay(1500, 0.2) // 失败后短暂等待
       }
     }
 
@@ -479,7 +477,7 @@ export class WeChatAPI {
   reset(): void {
     this.circuitBreaker.reset()
     this.rateLimiter.reset()
-    this.currentDelay = 2000
+    this.currentDelay = 500
     this.consecutive429 = 0
     this.warmupDone = false
     logger.info('API 客户端状态已重置')

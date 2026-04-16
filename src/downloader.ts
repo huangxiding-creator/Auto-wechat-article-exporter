@@ -51,6 +51,13 @@ export class ArticleDownloader {
   private downloadRecords: Map<string, DownloadRecord> = new Map()
   private mergeRecords: Map<string, AccountMergeRecord> = new Map()
   private mergedDir: string
+  private progressTimer: ReturnType<typeof setInterval> | null = null
+  private downloadStartTime: number = 0
+  private totalDownloadedArticles: number = 0
+  private totalSkippedArticles: number = 0
+  private totalFailedArticles: number = 0
+  private currentAccountName: string = ''
+  private currentAccountProgress: string = ''
 
   constructor(apiKey: string, downloadDir: string, webhookUrl?: string) {
     this.api = new WeChatAPI(apiKey)
@@ -152,6 +159,44 @@ export class ArticleDownloader {
       fs.writeFileSync(recordPath, JSON.stringify(data, null, 2), 'utf-8')
     } catch (error) {
       console.log(chalk.yellow('  保存合并记录失败'))
+    }
+  }
+
+  /**
+   * 启动定时进度汇报（每15分钟）
+   */
+  private startProgressReporter(): void {
+    this.stopProgressReporter()
+    const REPORT_INTERVAL = 15 * 60 * 1000 // 15分钟
+    this.progressTimer = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - this.downloadStartTime) / 1000)
+      const hours = Math.floor(elapsed / 3600)
+      const minutes = Math.floor((elapsed % 3600) / 60)
+      const timeStr = hours > 0 ? `${hours}小时${minutes}分钟` : `${minutes}分钟`
+
+      console.log(chalk.bold.cyan('\n⏱️  定时进度汇报'))
+      console.log(chalk.gray('─'.repeat(40)))
+      console.log(chalk.cyan(`  运行时间: ${timeStr}`))
+      console.log(chalk.green(`  已下载: ${this.totalDownloadedArticles} 篇`))
+      console.log(chalk.gray(`  已跳过: ${this.totalSkippedArticles} 篇`))
+      if (this.totalFailedArticles > 0) {
+        console.log(chalk.red(`  失败: ${this.totalFailedArticles} 篇`))
+      }
+      console.log(chalk.yellow(`  当前账号: ${this.currentAccountName || '无'}`))
+      if (this.currentAccountProgress) {
+        console.log(chalk.gray(`  当前进度: ${this.currentAccountProgress}`))
+      }
+      console.log(chalk.gray('─'.repeat(40) + '\n'))
+    }, REPORT_INTERVAL)
+  }
+
+  /**
+   * 停止定时进度汇报
+   */
+  private stopProgressReporter(): void {
+    if (this.progressTimer) {
+      clearInterval(this.progressTimer)
+      this.progressTimer = null
     }
   }
 
@@ -306,6 +351,7 @@ export class ArticleDownloader {
     try {
       articles = await this.api.getAllArticles(account.fakeid, (current, total) => {
         spinner.text = `获取文章列表... (${current}/${total})`
+        this.currentAccountProgress = `获取列表 ${current}/${total}`
       })
       spinner.succeed(`获取到 ${articles.length} 篇文章`)
     } catch (error) {
@@ -322,7 +368,7 @@ export class ArticleDownloader {
     let downloaded = 0
     let failed = 0
     let skipped = 0
-    const CONCURRENCY = 1 // 串行下载，避免触发限流
+    const CONCURRENCY = 5 // 高并发下载，速率限制器控制节奏
 
     // 过滤已下载的文章
     const pendingArticles = articles.filter(article => {
@@ -366,6 +412,7 @@ export class ArticleDownloader {
     for (let i = 0; i < pendingArticles.length; i += CONCURRENCY) {
       const batch = pendingArticles.slice(i, i + CONCURRENCY)
       const startIndex = articles.indexOf(batch[0]!)
+      this.currentAccountProgress = `下载中 ${startIndex + batch.length}/${articles.length} (成功${downloaded}, 失败${failed})`
 
       await Promise.all(
         batch.map((article, batchIndex) =>
@@ -373,10 +420,7 @@ export class ArticleDownloader {
         )
       )
 
-      // 批次间延迟，保护API
-      if (i + CONCURRENCY < pendingArticles.length) {
-        await this.delay(1000)
-      }
+      // 批次间延迟已由速率限制器控制，无需额外等待
     }
 
     // 保存下载记录
@@ -432,8 +476,17 @@ export class ArticleDownloader {
     console.log(chalk.gray(`下载目录: ${this.downloadDir}\n`))
 
     const batchStartTime = Date.now()
+    this.downloadStartTime = batchStartTime
+    this.totalDownloadedArticles = 0
+    this.totalSkippedArticles = 0
+    this.totalFailedArticles = 0
+    this.currentAccountName = ''
+    this.currentAccountProgress = ''
     const allResults: DownloadResult[] = []
     const results: { name: string; status: string; count: number }[] = []
+
+    // 启动定时进度汇报
+    this.startProgressReporter()
 
     // 检查并跳过已完成的公众号
     const completedAccounts: string[] = []
@@ -464,6 +517,8 @@ export class ArticleDownloader {
 
     for (const name of pendingAccounts) {
       const accountStartTime = Date.now()
+      this.currentAccountName = name
+      this.currentAccountProgress = '搜索中...'
       try {
         // 搜索公众号
         const account = await this.findAccountByName(name)
@@ -476,6 +531,10 @@ export class ArticleDownloader {
 
         // 下载文章
         const stats = await this.downloadAllArticles(account)
+        this.totalDownloadedArticles += stats.downloaded
+        this.totalSkippedArticles += (stats.total - stats.downloaded - stats.failed)
+        this.totalFailedArticles += stats.failed
+        this.currentAccountProgress = `完成 (成功${stats.downloaded}, 跳过${stats.total - stats.downloaded - stats.failed}, 失败${stats.failed})`
         results.push({ name, status: '成功', count: stats.downloaded })
 
         // 发送单个公众号完成通知
@@ -499,13 +558,16 @@ export class ArticleDownloader {
         await this.notification.sendErrorNotification(name, errorMessage)
       }
 
-      // 在下载下一个公众号之前，添加随机延迟（5-15秒），避免操作频繁
+      // 在下载下一个公众号之前，添加短暂随机延迟
       if (results.length < accountNames.length) {
-        const delaySeconds = 5 + Math.random() * 10
-        console.log(chalk.gray(`\n⏳ 等待 ${delaySeconds.toFixed(1)} 秒后继续下载下一个公众号...\n`))
+        const delaySeconds = 2 + Math.random() * 3
+        console.log(chalk.gray(`\n⏳ 等待 ${delaySeconds.toFixed(1)} 秒后继续...\n`))
         await this.delay(Math.floor(delaySeconds * 1000))
       }
     }
+
+    // 停止定时进度汇报
+    this.stopProgressReporter()
 
     // 打印汇总
     console.log(chalk.bold.cyan('\n📊 下载汇总\n'))

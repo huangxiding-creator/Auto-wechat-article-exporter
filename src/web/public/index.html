@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>微信公众号文章导出器</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+.container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+header { text-align: center; padding: 30px 0; border-bottom: 1px solid #1e293b; margin-bottom: 30px; }
+header h1 { font-size: 28px; color: #38bdf8; margin-bottom: 8px; }
+header p { color: #94a3b8; font-size: 14px; }
+
+/* API Key Section */
+.api-section { background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+.api-section label { display: block; font-size: 13px; color: #94a3b8; margin-bottom: 8px; }
+.api-section input { width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: 14px; }
+.api-section input:focus { outline: none; border-color: #38bdf8; }
+
+/* Account Input */
+.input-section { background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+.input-section label { display: block; font-size: 13px; color: #94a3b8; margin-bottom: 8px; }
+textarea { width: 100%; height: 120px; padding: 12px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: 14px; resize: vertical; }
+textarea:focus { outline: none; border-color: #38bdf8; }
+textarea::placeholder { color: #475569; }
+
+/* Buttons */
+.btn-group { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+button { padding: 10px 24px; border-radius: 8px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-start { background: #22c55e; color: #fff; }
+.btn-start:hover:not(:disabled) { background: #16a34a; }
+.btn-pause { background: #eab308; color: #000; }
+.btn-pause:hover:not(:disabled) { background: #ca8a04; }
+.btn-resume { background: #3b82f6; color: #fff; }
+.btn-resume:hover:not(:disabled) { background: #2563eb; }
+.btn-stop { background: #ef4444; color: #fff; }
+.btn-stop:hover:not(:disabled) { background: #dc2626; }
+
+/* Stats */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.stat-card { background: #1e293b; border-radius: 10px; padding: 16px; text-align: center; }
+.stat-card .value { font-size: 28px; font-weight: 700; color: #38bdf8; }
+.stat-card .label { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+.stat-card.success .value { color: #22c55e; }
+.stat-card.warning .value { color: #eab308; }
+.stat-card.danger .value { color: #ef4444; }
+
+/* Account List */
+.account-list { background: #1e293b; border-radius: 12px; overflow: hidden; }
+.account-header { padding: 16px 20px; font-size: 15px; font-weight: 600; border-bottom: 1px solid #334155; }
+.account-item { padding: 14px 20px; border-bottom: 1px solid #0f172a; transition: background 0.2s; }
+.account-item:last-child { border-bottom: none; }
+.account-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.account-name { font-weight: 600; font-size: 15px; }
+.account-status { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+.status-pending { background: #334155; color: #94a3b8; }
+.status-searching { background: #1e3a5f; color: #38bdf8; animation: pulse 1.5s infinite; }
+.status-downloading { background: #1e3a5f; color: #38bdf8; animation: pulse 1.5s infinite; }
+.status-completed { background: #14532d; color: #22c55e; }
+.status-failed { background: #450a0a; color: #ef4444; }
+.status-not_found { background: #422006; color: #eab308; }
+.status-paused { background: #422006; color: #eab308; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+.progress-bar { height: 6px; background: #334155; border-radius: 3px; overflow: hidden; margin-bottom: 6px; }
+.progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s; background: linear-gradient(90deg, #3b82f6, #22c55e); }
+.account-detail { font-size: 12px; color: #64748b; display: flex; gap: 16px; }
+.account-current { font-size: 12px; color: #94a3b8; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 600px; }
+
+/* Status indicator */
+.global-status { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; margin-bottom: 16px; }
+.global-status.idle { background: #334155; color: #94a3b8; }
+.global-status.running { background: #1e3a5f; color: #38bdf8; animation: pulse 1.5s infinite; }
+.global-status.paused { background: #422006; color: #eab308; }
+.global-status.completed { background: #14532d; color: #22c55e; }
+
+/* Duration */
+.timer { font-size: 13px; color: #64748b; text-align: right; margin-bottom: 12px; }
+
+.empty-state { text-align: center; padding: 40px; color: #475569; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>微信公众号文章导出器</h1>
+    <p>批量下载微信公众号历史文章，支持实时进度监控</p>
+  </header>
+
+  <!-- API Key -->
+  <div class="api-section" id="apiSection">
+    <label>API 密钥</label>
+    <input type="text" id="apiKey" placeholder="粘贴 API 密钥（从 down.mptext.top 获取）" />
+  </div>
+
+  <!-- Account Input -->
+  <div class="input-section">
+    <label>公众号名称列表（每行一个）</label>
+    <textarea id="accountList" placeholder="输入公众号名称，每行一个，例如：&#10;EPC工程精英汇&#10;走出去情报&#10;工程行业研究"></textarea>
+    <div class="btn-group">
+      <button class="btn-start" id="btnStart" onclick="startDownload()">开始下载</button>
+      <button class="btn-pause" id="btnPause" onclick="pauseDownload()" disabled>暂停</button>
+      <button class="btn-resume" id="btnResume" onclick="resumeDownload()" disabled>继续</button>
+      <button class="btn-stop" id="btnStop" onclick="stopDownload()" disabled>停止</button>
+    </div>
+  </div>
+
+  <!-- Global Status -->
+  <div id="globalStatusBar"></div>
+  <div class="timer" id="timer"></div>
+
+  <!-- Stats -->
+  <div class="stats" id="stats" style="display:none">
+    <div class="stat-card"><div class="value" id="statTotal">0</div><div class="label">总公众号</div></div>
+    <div class="stat-card success"><div class="value" id="statCompleted">0</div><div class="label">已完成</div></div>
+    <div class="stat-card"><div class="value" id="statArticles">0</div><div class="label">已下载文章</div></div>
+    <div class="stat-card danger"><div class="value" id="statFailed">0</div><div class="label">失败</div></div>
+  </div>
+
+  <!-- Account Progress -->
+  <div class="account-list" id="accountListPanel" style="display:none">
+    <div class="account-header">下载进度</div>
+    <div id="accounts"></div>
+  </div>
+</div>
+
+<script>
+let eventSource = null;
+
+function connectSSE() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/api/events');
+  eventSource.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    updateUI(data);
+  };
+  eventSource.onerror = () => {
+    setTimeout(connectSSE, 3000);
+  };
+}
+
+function updateUI(data) {
+  // Stats
+  const statsEl = document.getElementById('stats');
+  const listEl = document.getElementById('accountListPanel');
+  const hasData = data.totalAccounts > 0 || data.status !== 'idle';
+
+  statsEl.style.display = hasData ? 'grid' : 'none';
+  listEl.style.display = hasData ? 'block' : 'none';
+
+  if (!hasData) return;
+
+  document.getElementById('statTotal').textContent = data.totalAccounts;
+  document.getElementById('statCompleted').textContent = data.completedAccounts;
+  document.getElementById('statArticles').textContent = data.downloadedArticles;
+  document.getElementById('statFailed').textContent = data.failedArticles;
+
+  // Timer
+  if (data.duration > 0) {
+    const h = Math.floor(data.duration / 3600);
+    const m = Math.floor((data.duration % 3600) / 60);
+    const s = data.duration % 60;
+    document.getElementById('timer').textContent = `运行时间: ${h > 0 ? h + '时' : ''}${m}分${s}秒`;
+  }
+
+  // Global status
+  const statusMap = { idle: '空闲', running: '下载中...', paused: '已暂停', completed: '已完成' };
+  document.getElementById('globalStatusBar').innerHTML =
+    `<span class="global-status ${data.status}">${statusMap[data.status]}</span>`;
+
+  // Buttons
+  const running = data.status === 'running';
+  const paused = data.status === 'paused';
+  document.getElementById('btnStart').disabled = running || paused;
+  document.getElementById('btnPause').disabled = !running;
+  document.getElementById('btnResume').disabled = !paused;
+  document.getElementById('btnStop').disabled = data.status === 'idle';
+
+  // Account list
+  const container = document.getElementById('accounts');
+  const statusText = { pending: '待下载', searching: '搜索中', downloading: '下载中', completed: '已完成', failed: '失败', not_found: '未找到' };
+
+  let html = '';
+  for (const acc of data.accounts) {
+    const pct = acc.total > 0 ? Math.round((acc.downloaded + acc.skipped) / acc.total * 100) : 0;
+    const effectivePct = acc.status === 'completed' ? 100 : pct;
+    html += `<div class="account-item">
+      <div class="account-top">
+        <span class="account-name">${esc(acc.name)}</span>
+        <span class="account-status status-${acc.status}">${statusText[acc.status]}</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" style="width:${effectivePct}%"></div></div>
+      <div class="account-detail">
+        <span>总计: ${acc.total}</span>
+        <span>已下载: ${acc.downloaded}</span>
+        <span>跳过: ${acc.skipped}</span>
+        ${acc.failed > 0 ? `<span style="color:#ef4444">失败: ${acc.failed}</span>` : ''}
+        ${acc.total > 0 ? `<span>${effectivePct}%</span>` : ''}
+      </div>
+      ${acc.currentArticle ? `<div class="account-current">${esc(acc.currentArticle)}</div>` : ''}
+    </div>`;
+  }
+  container.innerHTML = html;
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function startDownload() {
+  const apiKey = document.getElementById('apiKey').value.trim();
+  const text = document.getElementById('accountList').value.trim();
+  const accounts = text.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+
+  if (!apiKey) { alert('请输入API密钥'); return; }
+  if (accounts.length === 0) { alert('请输入公众号名称'); return; }
+
+  await fetch('/api/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accounts, apiKey })
+  });
+}
+
+async function pauseDownload() {
+  await fetch('/api/pause', { method: 'POST' });
+}
+
+async function resumeDownload() {
+  await fetch('/api/resume', { method: 'POST' });
+}
+
+async function stopDownload() {
+  await fetch('/api/stop', { method: 'POST' });
+}
+
+// Auto-load API key from input
+connectSSE();
+</script>
+</body>
+</html>
