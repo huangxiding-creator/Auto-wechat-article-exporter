@@ -289,10 +289,10 @@ export class WeChatAPI {
     const allArticles: ArticleMessage['articles'] = []
     const articleMap = new Map<string, boolean>() // 用于去重
     let begin = 0
-    const size = 50 // 每页50篇，减少API请求次数（最大优化）
+    const size = 20 // API每页最大20篇
     let hasMore = true
     let pageCount = 0
-    const maxPages = 1000 // 支持最多50000篇文章（每页50）
+    const maxPages = 1000 // 支持最多20000篇文章（每页20）
     let totalCount = 0
     let consecutiveErrors = 0
     const maxConsecutiveErrors = 5 // 连续5次错误才放弃
@@ -343,9 +343,11 @@ export class WeChatAPI {
             begin += size
           }
 
-          // 如果返回的文章数小于请求的size，说明没有更多了
-          if (result.articles.length < size) {
-            hasMore = false
+          // 只在没有 next_offset 时用文章数量判断是否结束
+          if (result.next_offset === undefined || result.next_offset === null) {
+            if (result.articles.length < size) {
+              hasMore = false
+            }
           }
 
           // 如果已经获取了所有文章（允许一定误差）
